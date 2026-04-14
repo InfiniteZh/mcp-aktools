@@ -11,6 +11,20 @@ from pydantic import Field
 from datetime import datetime, timedelta
 from starlette.middleware.cors import CORSMiddleware
 from .cache import CacheKey
+from .contracts import (
+    advice_response,
+    dataframe_rows,
+    entity_profile_response,
+    error_response,
+    news_list_response,
+    normalize_mapping,
+    normalize_value,
+    profile_from_frame,
+    search_result_response,
+    snapshot_response,
+    table_response,
+    timeseries_response,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
@@ -36,9 +50,19 @@ def search(
 ):
     info = ak_search(None, keyword, market)
     if info is not None:
-        suffix = f"交易市场: {market}"
-        return "\n".join([info.to_string(), suffix])
-    return f"Not Found for {keyword}"
+        return search_result_response(
+            keyword,
+            market,
+            series_payload(info, market=market),
+            source="akshare",
+        )
+    return error_response(
+        "search_result",
+        "NOT_FOUND",
+        f"No match found for query '{keyword}' in market '{market}'",
+        source="akshare",
+        meta={"query": keyword, "market": market},
+    )
 
 
 @mcp.tool(
@@ -60,12 +84,29 @@ def stock_info(
         all = ak_cache(m[1], symbol=symbol, ttl=43200)
         if all is None or all.empty:
             continue
-        return all.to_string()
+        return entity_profile_response(
+            symbol,
+            market,
+            profile_from_frame(all),
+            source="akshare",
+        )
 
-    info = ak_search(symbol, market)
+    info = ak_search(symbol=symbol, market=market)
     if info is not None:
-        return info.to_string()
-    return f"Not Found for {symbol}.{market}"
+        return entity_profile_response(
+            symbol,
+            market,
+            series_payload(info, market=market),
+            source="akshare",
+            meta={"matched_by": "search_index"},
+        )
+    return error_response(
+        "entity_profile",
+        "NOT_FOUND",
+        f"No profile found for symbol '{symbol}' in market '{market}'",
+        source="akshare",
+        meta={"symbol": symbol, "market": market},
+    )
 
 
 @mcp.tool(
@@ -99,13 +140,44 @@ def stock_prices(
         if dfs is None or dfs.empty:
             continue
         add_technical_indicators(dfs, dfs["收盘"], dfs["最低"], dfs["最高"])
-        columns = [
-            "日期", "开盘", "收盘", "最高", "最低", "成交量", "换手率",
-            "MACD", "DIF", "DEA", "KDJ.K", "KDJ.D", "KDJ.J", "RSI", "BOLL.U", "BOLL.M", "BOLL.L",
-        ]
-        all = dfs.to_csv(columns=columns, index=False, float_format="%.2f").strip().split("\n")
-        return "\n".join([all[0], *all[-limit:]])
-    return f"Not Found for {symbol}.{market}"
+        items = timeseries_items(
+            dfs,
+            {
+                "日期": "time",
+                "开盘": "open",
+                "收盘": "close",
+                "最高": "high",
+                "最低": "low",
+                "成交量": "volume",
+                "换手率": "turnover_rate",
+                "MACD": "macd",
+                "DIF": "dif",
+                "DEA": "dea",
+                "KDJ.K": "kdj_k",
+                "KDJ.D": "kdj_d",
+                "KDJ.J": "kdj_j",
+                "RSI": "rsi",
+                "BOLL.U": "boll_upper",
+                "BOLL.M": "boll_middle",
+                "BOLL.L": "boll_lower",
+            },
+            limit=limit,
+        )
+        return timeseries_response(
+            symbol,
+            items,
+            source="akshare",
+            market=market,
+            interval=period,
+            meta={"requested_limit": limit},
+        )
+    return error_response(
+        "timeseries",
+        "NOT_FOUND",
+        f"No price history found for symbol '{symbol}' in market '{market}'",
+        source="akshare",
+        meta={"symbol": symbol, "market": market, "interval": period},
+    )
 
 
 def stock_us_daily(symbol, start_date="2025-01-01", period="daily"):
@@ -135,14 +207,24 @@ def stock_news(
     symbol: str = Field(description="股票代码/加密货币符号"),
     limit: int = Field(15, description="返回数量(int)", strict=False),
 ):
-    news = list(dict.fromkeys([
-        v["新闻内容"]
-        for v in ak_cache(stock_news_em, symbol=symbol, ttl=3600).to_dict(orient="records")
-        if isinstance(v, dict)
-    ]))
-    if news:
-        return "\n".join(news[0:limit])
-    return f"Not Found for {symbol}"
+    dfs = ak_cache(stock_news_em, symbol=symbol, ttl=3600)
+    items = dedupe_news_items(
+        [news_item_from_row(row, symbol=symbol) for row in dataframe_rows(dfs, limit=limit)]
+    )
+    if items:
+        return news_list_response(
+            symbol,
+            items,
+            source="eastmoney",
+            meta={"requested_limit": limit},
+        )
+    return error_response(
+        "news_list",
+        "NOT_FOUND",
+        f"No news found for symbol '{symbol}'",
+        source="eastmoney",
+        meta={"symbol": symbol, "requested_limit": limit},
+    )
 
 def stock_news_em(symbol, limit=20):
     cbk = "jQuery351013927587392975826_1763361926020"
@@ -164,9 +246,22 @@ def stock_news_em(symbol, limit=20):
     text = resp.text.replace(cbk, "").strip().strip("()")
     data = json.loads(text) or {}
     dfs = pd.DataFrame(data.get("result", {}).get("cmsArticleWebOld") or [])
+    if dfs.empty:
+        return dfs
     dfs.sort_values("date", ascending=False, inplace=True)
-    dfs = dfs.head(limit)
-    dfs["新闻内容"] = dfs["content"].str.replace(r"</?em>", "", regex=True)
+    dfs = dfs.head(limit).copy()
+    if "content" in dfs:
+        dfs["content"] = dfs["content"].str.replace(r"</?em>", "", regex=True)
+    if "title" in dfs:
+        dfs["title"] = dfs["title"].str.replace(r"</?em>", "", regex=True)
+    if "date" in dfs:
+        dfs["published_at"] = dfs["date"]
+    if "mediaName" in dfs:
+        dfs["source"] = dfs["mediaName"]
+    elif "media_name" in dfs:
+        dfs["source"] = dfs["media_name"]
+    if "articleUrl" in dfs and "url" not in dfs:
+        dfs["url"] = dfs["articleUrl"]
     return dfs
 
 
@@ -178,8 +273,20 @@ def stock_indicators_a(
     symbol: str = field_symbol,
 ):
     dfs = ak_cache(ak.stock_financial_abstract_ths, symbol=symbol)
-    keys = dfs.to_csv(index=False, float_format="%.3f").strip().split("\n")
-    return "\n".join([keys[0], *keys[-15:]])
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No financial indicators found for symbol '{symbol}'",
+            source="akshare",
+            meta={"symbol": symbol},
+        )
+    return table_response(
+        "stock_indicators_a",
+        dfs.tail(15),
+        source="akshare",
+        meta={"symbol": symbol},
+    )
 
 
 @mcp.tool(
@@ -190,8 +297,20 @@ def stock_indicators_hk(
     symbol: str = field_symbol,
 ):
     dfs = ak_cache(ak.stock_financial_hk_analysis_indicator_em, symbol=symbol, indicator="报告期")
-    keys = dfs.to_csv(index=False, float_format="%.3f").strip().split("\n")
-    return "\n".join(keys[0:15])
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No financial indicators found for symbol '{symbol}'",
+            source="akshare",
+            meta={"symbol": symbol},
+        )
+    return table_response(
+        "stock_indicators_hk",
+        dfs.head(15),
+        source="akshare",
+        meta={"symbol": symbol},
+    )
 
 
 @mcp.tool(
@@ -202,8 +321,20 @@ def stock_indicators_us(
     symbol: str = field_symbol,
 ):
     dfs = ak_cache(ak.stock_financial_us_analysis_indicator_em, symbol=symbol, indicator="单季报")
-    keys = dfs.to_csv(index=False, float_format="%.3f").strip().split("\n")
-    return "\n".join(keys[0:15])
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No financial indicators found for symbol '{symbol}'",
+            source="akshare",
+            meta={"symbol": symbol},
+        )
+    return table_response(
+        "stock_indicators_us",
+        dfs.head(15),
+        source="akshare",
+        meta={"symbol": symbol},
+    )
 
 
 @mcp.tool(
@@ -213,18 +344,26 @@ def stock_indicators_us(
 def get_current_time():
     now = datetime.now()
     week = "日一二三四五六日"[now.isoweekday()]
-    texts = [f"当前时间: {now.isoformat()}, 星期{week}"]
+    snapshot = {
+        "current_time": now.isoformat(),
+        "weekday": f"星期{week}",
+        "recent_trade_dates": [],
+    }
     dfs = ak_cache(ak.tool_trade_date_hist_sina, ttl=43200)
     if dfs is not None:
         start = now.date() - timedelta(days=5)
         ended = now.date() + timedelta(days=5)
-        dates = [
+        snapshot["recent_trade_dates"] = [
             d.strftime("%Y-%m-%d")
             for d in dfs["trade_date"]
             if start <= d <= ended
         ]
-        texts.append(f", 最近交易日有: {','.join(dates)}")
-    return "".join(texts)
+    return snapshot_response(
+        "current_time",
+        snapshot,
+        source="system",
+        meta={"market_scope": "a_share"},
+    )
 
 def recent_trade_date():
     now = datetime.now().date()
@@ -249,6 +388,14 @@ def stock_zt_pool_em(
     if not date:
         date = recent_trade_date().strftime("%Y%m%d")
     dfs = ak_cache(ak.stock_zt_pool_em, date=date, ttl=1200)
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No limit-up pool data found for trade date '{date}'",
+            source="akshare",
+            meta={"trade_date": date},
+        )
     cnt = len(dfs)
     try:
         dfs.drop(columns=["序号", "流通市值", "总市值"], inplace=True)
@@ -256,8 +403,12 @@ def stock_zt_pool_em(
         pass
     dfs.sort_values("成交额", ascending=False, inplace=True)
     dfs = dfs.head(int(limit))
-    desc = f"共{cnt}只涨停股\n"
-    return desc + dfs.to_csv(index=False, float_format="%.2f").strip()
+    return table_response(
+        "stock_zt_pool_em",
+        dfs,
+        source="akshare",
+        meta={"trade_date": date, "total_count": cnt},
+    )
 
 
 @mcp.tool(
@@ -271,13 +422,26 @@ def stock_zt_pool_strong_em(
     if not date:
         date = recent_trade_date().strftime("%Y%m%d")
     dfs = ak_cache(ak.stock_zt_pool_strong_em, date=date, ttl=1200)
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No strong stock pool data found for trade date '{date}'",
+            source="akshare",
+            meta={"trade_date": date},
+        )
     try:
         dfs.drop(columns=["序号", "流通市值", "总市值"], inplace=True)
     except Exception:
         pass
     dfs.sort_values("成交额", ascending=False, inplace=True)
     dfs = dfs.head(int(limit))
-    return dfs.to_csv(index=False, float_format="%.2f").strip()
+    return table_response(
+        "stock_zt_pool_strong_em",
+        dfs,
+        source="akshare",
+        meta={"trade_date": date},
+    )
 
 
 @mcp.tool(
@@ -289,8 +453,21 @@ def stock_lhb_ggtj_sina(
     limit: int = Field(50, description="返回数量(int,30-100)", strict=False),
 ):
     dfs = ak_cache(ak.stock_lhb_ggtj_sina, symbol=days, ttl=3600)
+    if dfs is None or dfs.empty:
+        return error_response(
+            "table",
+            "NOT_FOUND",
+            f"No ranking data found for recent days '{days}'",
+            source="akshare",
+            meta={"days": days},
+        )
     dfs = dfs.head(int(limit))
-    return dfs.to_csv(index=False, float_format="%.2f").strip()
+    return table_response(
+        "stock_lhb_ggtj_sina",
+        dfs,
+        source="akshare",
+        meta={"days": days},
+    )
 
 
 @mcp.tool(
@@ -303,7 +480,13 @@ def stock_sector_fund_flow_rank(
 ):
     dfs = ak_cache(ak.stock_sector_fund_flow_rank, indicator=days, sector_type=cate, ttl=1200)
     if dfs is None:
-        return "获取数据失败"
+        return error_response(
+            "table",
+            "UPSTREAM_ERROR",
+            "Failed to fetch sector fund flow data",
+            source="akshare",
+            meta={"indicator": days, "sector_type": cate},
+        )
     try:
         dfs.sort_values("今日涨跌幅", ascending=False, inplace=True)
         dfs.drop(columns=["序号"], inplace=True)
@@ -311,9 +494,20 @@ def stock_sector_fund_flow_rank(
         pass
     try:
         dfs = pd.concat([dfs.head(20), dfs.tail(20)])
-        return dfs.to_csv(index=False, float_format="%.2f").strip()
+        return table_response(
+            "stock_sector_fund_flow_rank",
+            dfs,
+            source="akshare",
+            meta={"indicator": days, "sector_type": cate},
+        )
     except Exception as exc:
-        return str(exc)
+        return error_response(
+            "table",
+            "UPSTREAM_ERROR",
+            str(exc),
+            source="akshare",
+            meta={"indicator": days, "sector_type": cate},
+        )
 
 
 @mcp.tool(
@@ -324,13 +518,26 @@ def stock_news_global():
     news = []
     try:
         dfs = ak.stock_info_global_sina()
-        csv = dfs.to_csv(index=False, float_format="%.2f").strip()
-        csv = csv.replace(datetime.now().strftime("%Y-%m-%d "), "")
-        news.extend(csv.split("\n"))
+        for row in dataframe_rows(dfs):
+            news.append(global_news_item_from_row(row, default_source="sina"))
     except Exception:
         pass
     news.extend(newsnow_news())
-    return "\n".join(news)
+    news = dedupe_news_items(news)
+    if news:
+        return news_list_response(
+            None,
+            news,
+            source="aggregated",
+            meta={"upstream_sources": ["sina", "newsnow"]},
+        )
+    return error_response(
+        "news_list",
+        "NOT_FOUND",
+        "No global finance news found",
+        source="aggregated",
+        meta={"upstream_sources": ["sina", "newsnow"]},
+    )
 
 
 def newsnow_news(channels=None):
@@ -359,7 +566,17 @@ def newsnow_news(channels=None):
                 extra = v.get("extra") or {}
                 hover = extra.get("hover") or title
                 info = extra.get("info") or ""
-                all.append(f"{hover} {info}".strip().replace("\n", " "))
+                all.append(
+                    {
+                        "title": sanitize_text(title or hover),
+                        "content": sanitize_text(hover if hover != title else info),
+                        "source": item.get("source") or item.get("name") or "newsnow",
+                        "published_at": v.get("time") or v.get("published_at"),
+                        "url": v.get("url") or extra.get("url"),
+                        "channel": item.get("source") or item.get("name"),
+                        "info": sanitize_text(info),
+                    }
+                )
     except Exception:
         pass
     return all
@@ -381,14 +598,20 @@ def okx_prices(
         params={
             "instId": instId,
             "bar": bar,
-            "limit": max(300, limit + 62),
+            "limit": min(300, limit + 62),
         },
         timeout=20,
     )
     data = res.json() or {}
     dfs = pd.DataFrame(data.get("data", []))
     if dfs.empty:
-        return pd.DataFrame()
+        return error_response(
+            "timeseries",
+            "NOT_FOUND",
+            f"No OKX candle data found for instrument '{instId}'",
+            source="okx",
+            meta={"symbol": instId, "interval": bar},
+        )
     dfs.columns = ["时间", "开盘", "最高", "最低", "收盘", "成交量", "成交额", "成交额USDT", "K线已完结"]
     dfs.sort_values("时间", inplace=True)
     dfs["时间"] = pd.to_datetime(dfs["时间"], errors="coerce", unit="ms")
@@ -403,8 +626,37 @@ def okx_prices(
         "时间", "开盘", "收盘", "最高", "最低", "成交量", "成交额",
         "MACD", "DIF", "DEA", "KDJ.K", "KDJ.D", "KDJ.J", "RSI", "BOLL.U", "BOLL.M", "BOLL.L",
     ]
-    all = dfs.to_csv(columns=columns, index=False, float_format="%.2f").strip().split("\n")
-    return "\n".join([all[0], *all[-limit:]])
+    items = timeseries_items(
+        dfs[columns],
+        {
+            "时间": "time",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "volume",
+            "成交额": "amount",
+            "MACD": "macd",
+            "DIF": "dif",
+            "DEA": "dea",
+            "KDJ.K": "kdj_k",
+            "KDJ.D": "kdj_d",
+            "KDJ.J": "kdj_j",
+            "RSI": "rsi",
+            "BOLL.U": "boll_upper",
+            "BOLL.M": "boll_middle",
+            "BOLL.L": "boll_lower",
+        },
+        limit=limit,
+    )
+    return timeseries_response(
+        instId,
+        items,
+        source="okx",
+        market="crypto",
+        interval=bar,
+        meta={"requested_limit": limit},
+    )
 
 
 @mcp.tool(
@@ -426,11 +678,23 @@ def okx_loan_ratios(
     data = res.json() or {}
     dfs = pd.DataFrame(data.get("data", []))
     if dfs.empty:
-        return pd.DataFrame()
+        return error_response(
+            "timeseries",
+            "NOT_FOUND",
+            f"No OKX loan ratio data found for symbol '{symbol}'",
+            source="okx",
+            meta={"symbol": symbol, "interval": period},
+        )
     dfs.columns = ["时间", "多空比"]
     dfs["时间"] = pd.to_datetime(dfs["时间"], errors="coerce", unit="ms")
     dfs["多空比"] = pd.to_numeric(dfs["多空比"], errors="coerce")
-    return dfs.to_csv(index=False, float_format="%.2f").strip()
+    return timeseries_response(
+        symbol,
+        timeseries_items(dfs, {"时间": "time", "多空比": "long_short_ratio"}),
+        source="okx",
+        market="crypto",
+        interval=period,
+    )
 
 
 @mcp.tool(
@@ -454,12 +718,25 @@ def okx_taker_volume(
     data = res.json() or {}
     dfs = pd.DataFrame(data.get("data", []))
     if dfs.empty:
-        return pd.DataFrame()
+        return error_response(
+            "timeseries",
+            "NOT_FOUND",
+            f"No OKX taker volume data found for symbol '{symbol}'",
+            source="okx",
+            meta={"symbol": symbol, "interval": period, "instrument_type": instType},
+        )
     dfs.columns = ["时间", "卖出量", "买入量"]
     dfs["时间"] = pd.to_datetime(dfs["时间"], errors="coerce", unit="ms")
     dfs["卖出量"] = pd.to_numeric(dfs["卖出量"], errors="coerce")
     dfs["买入量"] = pd.to_numeric(dfs["买入量"], errors="coerce")
-    return dfs.to_csv(index=False, float_format="%.2f").strip()
+    return timeseries_response(
+        symbol,
+        timeseries_items(dfs, {"时间": "time", "卖出量": "sell_volume", "买入量": "buy_volume"}),
+        source="okx",
+        market="crypto",
+        interval=period,
+        meta={"instrument_type": instType},
+    )
 
 
 @mcp.tool(
@@ -492,7 +769,19 @@ def binance_ai_report(
         try:
             resp = json.loads(res.text.strip()) or {}
         except Exception:
-            return res.text
+            txt = sanitize_text(res.text)
+            if txt:
+                return advice_response(
+                    {"symbol": symbol, "analysis": [txt]},
+                    source="binance",
+                )
+            return error_response(
+                "advice",
+                "UPSTREAM_ERROR",
+                f"Failed to parse Binance AI report for symbol '{symbol}'",
+                source="binance",
+                meta={"symbol": symbol},
+            )
     data = resp.get('data') or {}
     report = data.get('report') or {}
     translated = report.get('translated') or report.get('original') or {}
@@ -503,7 +792,19 @@ def binance_ai_report(
             txts.append(tit)
         for point in module.get('points', []):
             txts.append(point.get('content', ''))
-    return '\n'.join(txts)
+    txts = [sanitize_text(v) for v in txts if sanitize_text(v)]
+    if txts:
+        return advice_response(
+            {"symbol": symbol, "analysis": txts},
+            source="binance",
+        )
+    return error_response(
+        "advice",
+        "NOT_FOUND",
+        f"No Binance AI report found for symbol '{symbol}'",
+        source="binance",
+        meta={"symbol": symbol},
+    )
 
 
 @mcp.tool(
@@ -516,12 +817,15 @@ def trading_suggest(
     score: int = Field(description="置信度，范围: 0-100"),
     reason: str = Field(description="推荐理由"),
 ):
-    return {
-        "symbol": symbol,
-        "action": action,
-        "score": score,
-        "reason": reason,
-    }
+    return advice_response(
+        {
+            "symbol": symbol,
+            "action": action,
+            "score": score,
+            "reason": reason,
+        },
+        source="user_input",
+    )
 
 
 def ak_search(symbol=None, keyword=None, market=None):
@@ -608,6 +912,92 @@ def add_technical_indicators(df, clos, lows, high):
     std = clos.rolling(window=20).std()
     df["BOLL.U"] = df["BOLL.M"] + 2 * std
     df["BOLL.L"] = df["BOLL.M"] - 2 * std
+
+
+def series_payload(series, market=None):
+    if series is None:
+        return None
+    data = normalize_mapping(series.to_dict())
+    if market:
+        data.setdefault("market", market)
+    symbol = pick_first(data, "code", "代码", "symbol", "A股代码", "证券代码", "基金代码")
+    name = pick_first(data, "name", "名称", "中文名称", "证券简称", "A股简称", "基金名称", "cname")
+    if symbol is not None:
+        data.setdefault("symbol", symbol)
+    if name is not None:
+        data.setdefault("name", name)
+    return data
+
+
+def timeseries_items(frame, mapping, limit=None):
+    if frame is None or frame.empty:
+        return []
+    data = frame.tail(int(limit)) if limit else frame
+    items = []
+    for _, row in data.iterrows():
+        item = {}
+        for source_key, target_key in mapping.items():
+            if source_key in row:
+                item[target_key] = normalize_value(row[source_key])
+        items.append(item)
+    return items
+
+
+def sanitize_text(value):
+    if value is None:
+        return None
+    text = str(value).replace("\n", " ").strip()
+    return text or None
+
+
+def pick_first(mapping, *keys):
+    for key in keys:
+        if key in mapping and mapping[key] not in [None, ""]:
+            return mapping[key]
+    return None
+
+
+def news_item_from_row(row, symbol=None, default_source="eastmoney"):
+    title = pick_first(row, "title", "标题", "新闻标题")
+    content = pick_first(row, "content", "内容", "新闻内容", "summary", "摘要")
+    published_at = pick_first(row, "published_at", "date", "时间", "发布时间")
+    source = pick_first(row, "source", "来源", "媒体名称", "mediaName") or default_source
+    url = pick_first(row, "url", "articleUrl", "链接")
+    item = {
+        "title": sanitize_text(title) or sanitize_text(content),
+        "content": sanitize_text(content) or sanitize_text(title),
+        "source": sanitize_text(source),
+        "published_at": normalize_value(published_at),
+        "url": sanitize_text(url),
+    }
+    if symbol:
+        item["symbol"] = symbol
+    raw = {k: v for k, v in normalize_mapping(row).items() if k not in {"title", "content", "source", "published_at", "url"}}
+    if raw:
+        item["raw"] = raw
+    return item
+
+
+def global_news_item_from_row(row, default_source="sina"):
+    return news_item_from_row(row, default_source=default_source)
+
+
+def dedupe_news_items(items):
+    all_items = []
+    seen = set()
+    for item in items:
+        if not item:
+            continue
+        title = sanitize_text(item.get("title"))
+        content = sanitize_text(item.get("content"))
+        if not title and not content:
+            continue
+        key = (title, content)
+        if key in seen:
+            continue
+        seen.add(key)
+        all_items.append(item)
+    return all_items
 
 
 def main():

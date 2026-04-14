@@ -79,6 +79,105 @@ docker-compose up -d
 
 ------
 
+## 响应协议
+
+从当前版本开始，所有 MCP 工具统一返回结构化 JSON，不再混用纯文本、CSV 字符串和临时字典。
+
+统一外层结构如下：
+
+```json
+{
+  "ok": true,
+  "kind": "timeseries",
+  "data": {},
+  "error": null,
+  "meta": {
+    "source": "akshare",
+    "generated_at": "2026-04-14T12:00:00+08:00"
+  }
+}
+```
+
+失败时：
+
+```json
+{
+  "ok": false,
+  "kind": "timeseries",
+  "data": null,
+  "error": {
+    "code": "NOT_FOUND",
+    "message": "No data found"
+  },
+  "meta": {
+    "source": "akshare",
+    "generated_at": "2026-04-14T12:00:00+08:00"
+  }
+}
+```
+
+`kind` 目前收敛为以下几类：
+
+- `search_result`
+- `entity_profile`
+- `timeseries`
+- `table`
+- `news_list`
+- `snapshot`
+- `advice`
+
+这套设计面向 AI 通过 MCP 消费数据：
+
+- AI 可以先看 `ok` 判断成功或失败
+- 再看 `kind` 决定如何理解 `data`
+- `meta` 提供来源、数量、生成时间等辅助信息
+
+------
+
+## mcporter 调用
+
+可以直接用 `mcporter` 通过 stdio 启动并测试这个 MCP：
+
+```bash
+mcporter --config ./config/mcporter.json list \
+  --stdio .venv/bin/python \
+  --stdio-arg -m \
+  --stdio-arg mcp_aktools \
+  --cwd /abs/path/to/mcp-aktools \
+  --schema
+```
+
+调用工具示例：
+
+```bash
+mcporter --config ./config/mcporter.json call \
+  --stdio .venv/bin/python \
+  --stdio-arg -m \
+  --stdio-arg mcp_aktools \
+  --cwd /abs/path/to/mcp-aktools \
+  "stock_info(symbol: \"600519\", market: \"sh\")" \
+  --output raw
+```
+
+```bash
+mcporter --config ./config/mcporter.json call \
+  --stdio .venv/bin/python \
+  --stdio-arg -m \
+  --stdio-arg mcp_aktools \
+  --cwd /abs/path/to/mcp-aktools \
+  get_current_time \
+  --output raw
+```
+
+### mcporter 注意事项
+
+- `--output json` 更偏向展示 `structuredContent.data`，适合快速看业务结果。
+- `--output raw` 会显示完整 MCP `ToolResult`，其中包含 `structuredContent`，更适合检查完整响应外壳。
+- 纯数字股票代码建议显式加引号，例如 `"600519"`。否则 CLI 可能把参数推断成数字，触发字符串类型校验错误。
+- 如果更想稳定传参，优先使用 function-call 语法或 `--args` JSON，而不是未加引号的 `key=value`。
+
+------
+
 ## 🛠️ 可用工具
 
 <details>
